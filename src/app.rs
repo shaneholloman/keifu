@@ -1,10 +1,13 @@
 //! Application state management
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 use git2::Oid;
@@ -16,12 +19,14 @@ use crate::{
         build_graph,
         graph::GraphLayout,
         operations::{
-            checkout_branch, checkout_commit, checkout_remote_branch, create_branch, delete_branch,
-            fetch_origin, merge_branch, rebase_branch,
+            checkout_branch, checkout_commit, checkout_remote_branch, create_branch, create_commit,
+            delete_branch, fetch_origin, merge_branch, push_branch, rebase_branch, stage_all,
+            stage_path, unstage_all, unstage_path,
         },
         BranchInfo, CommitDiffInfo, CommitInfo, FileDiffContent, FileDiffInfo, GitRepository,
-        WorkingTreeStatus,
+        StageState, WorkingTreeStatus,
     },
+    perf::PerfStats,
     search::{fuzzy_search_branches, FuzzySearchResult},
 };
 
@@ -88,6 +93,24 @@ pub enum AppMode {
 pub enum InputAction {
     CreateBranch,
     Search,
+    CommitMessage,
+}
+
+/// Focusable panes in Normal mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusedPane {
+    #[default]
+    Graph,
+    Detail,
+}
+
+/// Screen regions of the main panes, recorded during render for mouse routing
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LayoutMap {
+    pub graph: Rect,
+    pub commit_detail: Rect,
+    pub files: Rect,
+    pub status_bar: Rect,
 }
 
 /// Confirmation action kinds
@@ -96,6 +119,7 @@ pub enum ConfirmAction {
     DeleteBranch(String),
     Merge(String),
     Rebase(String),
+    Push(String),
 }
 
 /// Result of async diff computation
@@ -189,6 +213,23 @@ pub struct App {
 
     // UI state
     pub graph_list_state: ListState,
+    pub focused_pane: FocusedPane,
+    /// Scroll offset of the commit detail pane (issue #27)
+    pub detail_scroll: u16,
+    /// Total line count of the commit detail content (updated during render)
+    pub detail_content_height: u16,
+    /// Visible height of the commit detail pane (updated during render)
+    pub detail_viewport_height: u16,
+    /// Pane regions for mouse hit-testing (updated during render)
+    pub layout: LayoutMap,
+    /// Scroll offset of the changed files pane (updated during render)
+    pub files_pane_scroll: u16,
+    /// Last mouse click (time, column, row) for double-click detection
+    pub last_click: Option<(Instant, u16, u16)>,
+    /// Clickable status bar hint regions (updated during render)
+    pub status_hints: Vec<(Rect, Action)>,
+    /// Performance counters (inspect via the debug server's "perf" command)
+    pub perf: PerfStats,
 
     // Branch selection state
     /// List of (node_index, branch_name) for all branches
@@ -201,6 +242,9 @@ pub struct App {
 
     // Latest working tree status snapshot
     working_tree_status: Option<WorkingTreeStatus>,
+
+    /// Per-file stage states (populated while the uncommitted node is selected)
+    pub stage_states: HashMap<PathBuf, StageState>,
 
     // Diff cache (async load)
     diff_cache: Option<CommitDiffInfo>,
@@ -235,6 +279,9 @@ pub struct App {
     /// Whether to suppress error dialogs for fetch failures (for auto-fetch)
     fetch_silent: bool,
 
+    // Async push
+    push_receiver: Option<Receiver<Result<(), String>>>,
+
     // Auto-refresh state
     config: Config,
     last_refresh_time: Instant,
@@ -242,12 +289,24 @@ pub struct App {
 }
 
 impl App {
-    fn working_tree_status_snapshot(
+    /// One `statuses()` scan yielding both the status snapshot (diff cache
+    /// key) and per-file stage states. The scan is the most expensive call
+    /// on the UI thread, so callers must not run it twice.
+    #[allow(clippy::type_complexity)]
+    fn working_tree_snapshot(
         repo: &GitRepository,
-    ) -> (Option<WorkingTreeStatus>, Option<String>) {
-        match repo.get_working_tree_status() {
-            Ok(status) => (status, None),
-            Err(e) => (None, Some(format!("Working tree status failed: {e}"))),
+    ) -> (
+        Option<WorkingTreeStatus>,
+        HashMap<PathBuf, StageState>,
+        Option<String>,
+    ) {
+        match repo.working_tree_overview() {
+            Ok((status, states)) => (status, states, None),
+            Err(e) => (
+                None,
+                HashMap::new(),
+                Some(format!("Working tree status failed: {e}")),
+            ),
         }
     }
 
@@ -262,7 +321,8 @@ impl App {
 
         let commits = repo.get_commits(500)?;
         let branches = repo.get_branches()?;
-        let (working_tree_status, initial_message) = Self::working_tree_status_snapshot(&repo);
+        let (working_tree_status, stage_states, initial_message) =
+            Self::working_tree_snapshot(&repo);
         let initial_message_time = initial_message.as_ref().map(|_| now);
         let uncommitted_count = working_tree_status
             .as_ref()
@@ -289,7 +349,7 @@ impl App {
             Some(0)
         };
 
-        Ok(Self {
+        let app = Self {
             mode: AppMode::Normal,
             repo,
             repo_path,
@@ -298,10 +358,20 @@ impl App {
             branches,
             graph_layout,
             graph_list_state,
+            focused_pane: FocusedPane::default(),
+            detail_scroll: 0,
+            detail_content_height: 0,
+            detail_viewport_height: 0,
+            layout: LayoutMap::default(),
+            files_pane_scroll: 0,
+            last_click: None,
+            status_hints: Vec::new(),
+            perf: PerfStats::default(),
             branch_positions,
             selected_branch_position,
             search_state: SearchState::default(),
             working_tree_status,
+            stage_states,
             diff_cache: None,
             diff_cache_oid: None,
             diff_loading_oid: None,
@@ -321,10 +391,12 @@ impl App {
             message_time: initial_message_time,
             fetch_receiver: None,
             fetch_silent: false,
+            push_receiver: None,
             config,
             last_refresh_time: now,
             last_fetch_time: now,
-        })
+        };
+        Ok(app)
     }
 
     /// Clear all diff caches
@@ -399,6 +471,7 @@ impl App {
         if self.selected_diff_target != target {
             self.selected_diff_target = target;
             self.selected_diff_target_changed_at = Instant::now();
+            self.detail_scroll = 0;
         }
         target
     }
@@ -437,6 +510,8 @@ impl App {
     /// If `force` is true, always clears diff cache (for manual refresh)
     /// If `force` is false, keeps cache when the same content is selected (for auto-refresh)
     pub fn refresh(&mut self, force: bool) -> Result<()> {
+        tracing::debug!(force, "refresh repository data");
+        let refresh_started = Instant::now();
         // Save the current selection state for restoration
         let was_uncommitted_selected = self
             .graph_list_state
@@ -456,7 +531,10 @@ impl App {
             .map(|(_, name)| name.clone());
 
         // Get working tree status once and reuse
-        let (working_tree_status, status_message) = Self::working_tree_status_snapshot(&self.repo);
+        let status_started = Instant::now();
+        let (working_tree_status, stage_states, status_message) =
+            Self::working_tree_snapshot(&self.repo);
+        self.perf.record("refresh.status", status_started.elapsed());
         if let Some(message) = status_message {
             self.set_message(message);
         }
@@ -464,16 +542,21 @@ impl App {
             .as_ref()
             .map(|s| s.accurate_file_count());
         self.working_tree_status = working_tree_status;
+        self.stage_states = stage_states;
 
+        let log_started = Instant::now();
         self.commits = self.repo.get_commits(500)?;
         self.branches = self.repo.get_branches()?;
+        self.perf.record("refresh.log", log_started.elapsed());
         let head_commit_oid = self.repo.head_oid();
+        let graph_started = Instant::now();
         self.graph_layout = build_graph(
             &self.commits,
             &self.branches,
             uncommitted_count,
             head_commit_oid,
         );
+        self.perf.record("refresh.graph", graph_started.elapsed());
         self.head_name = self.repo.head_name();
 
         // Rebuild branch positions
@@ -560,6 +643,8 @@ impl App {
                 self.graph_list_state.select(Some(max_commit));
             }
         }
+
+        self.perf.record("refresh", refresh_started.elapsed());
 
         Ok(())
     }
@@ -679,9 +764,57 @@ impl App {
         self.fetch_receiver.is_some()
     }
 
+    /// Check if push is currently in progress
+    pub fn is_pushing(&self) -> bool {
+        self.push_receiver.is_some()
+    }
+
+    /// Check if async push has completed and process the result
+    pub fn update_push_status(&mut self) {
+        let Some(rx) = &self.push_receiver else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        self.push_receiver = None;
+
+        match result {
+            Ok(()) => {
+                self.set_message("Pushed to origin");
+                self.reset_timers();
+                if let Err(e) = self.refresh(true) {
+                    self.show_error(format!("Refresh failed: {e}"));
+                }
+            }
+            Err(e) => self.show_error(e),
+        }
+    }
+
+    /// Start push in background
+    fn start_push(&mut self, branch: String) {
+        let (tx, rx) = mpsc::channel();
+        let repo_path = self.repo_path.clone();
+        let message = format!("Pushing '{}' to origin...", branch);
+
+        thread::spawn(move || {
+            let result = push_branch(&repo_path, &branch).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+
+        self.push_receiver = Some(rx);
+        self.set_message(message);
+    }
+
     /// Check and perform auto-refresh if interval has elapsed
     pub fn check_auto_refresh(&mut self) {
         if self.is_fetching() {
+            return;
+        }
+        // A synchronous refresh would delay any queued input by its full
+        // duration (perceived as a slow click); let input win and retry on
+        // the next tick.
+        if crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
             return;
         }
         if matches!(
@@ -750,8 +883,8 @@ impl App {
     pub fn get_message(&self) -> Option<&str> {
         const MESSAGE_TIMEOUT_SECS: u64 = 5;
 
-        // Don't timeout while fetching
-        if self.is_fetching() {
+        // Don't timeout while fetching or pushing
+        if self.is_fetching() || self.is_pushing() {
             return self.message.as_deref();
         }
 
@@ -806,24 +939,35 @@ impl App {
                 Ok((result, status)) => {
                     match result {
                         Ok(diff) => {
+                            tracing::debug!(files = diff.files.len(), "uncommitted diff loaded");
                             self.uncommitted_diff_cache = Some(diff);
                             self.uncommitted_diff_failed = false;
                             self.sync_file_list_with_uncommitted_diff();
                         }
                         Err(e) => {
+                            tracing::warn!(error = %e, "uncommitted diff load failed");
                             self.uncommitted_diff_cache = None;
                             self.uncommitted_diff_failed = true;
                             self.set_message(format!("Failed to load diff: {e}"));
                         }
                     }
                     // Set the cache key only when the thread's status snapshot
-                    // still matches the current working tree status.  If
-                    // refresh() has already observed a newer state, leave the
-                    // key as None so the next update_diff_cache() tick starts a
-                    // fresh computation.  The stale diff data is kept in
-                    // uncommitted_diff_cache for display to avoid flicker until
-                    // the new result arrives.
+                    // still matches the current working tree status.  When they
+                    // differ, `working_tree_status` itself may simply be stale
+                    // (auto-refresh is paused in FileSelect/FileDiff modes), so
+                    // re-snapshot before deciding.  Without this, a single
+                    // mismatch caused an endless load loop: the key was never
+                    // set, so every tick discarded the result and recomputed
+                    // (issue #26).
                     let effective_status = status.or_else(|| self.working_tree_status.clone());
+                    if effective_status.as_ref() != self.working_tree_status.as_ref() {
+                        let (fresh, states, message) = Self::working_tree_snapshot(&self.repo);
+                        if let Some(message) = message {
+                            self.set_message(message);
+                        }
+                        self.working_tree_status = fresh;
+                        self.stage_states = states;
+                    }
                     if effective_status.as_ref() == self.working_tree_status.as_ref() {
                         self.uncommitted_cache_key = effective_status;
                     }
@@ -861,6 +1005,7 @@ impl App {
 
         match target {
             DiffTarget::Uncommitted => {
+                tracing::debug!("spawning uncommitted diff computation");
                 // Compute uncommitted diff in the background
                 let (tx, rx) = mpsc::channel();
                 let repo_path = self.repo_path.clone();
@@ -892,6 +1037,7 @@ impl App {
                 });
             }
             DiffTarget::Commit(oid) => {
+                tracing::debug!(%oid, "spawning commit diff computation");
                 // Compute diff in the background
                 let (tx, rx) = mpsc::channel();
                 let repo_path = self.repo_path.clone();
@@ -949,32 +1095,50 @@ impl App {
 
     /// Show an error
     pub fn show_error(&mut self, message: String) {
+        tracing::warn!(%message, "showing error");
         self.mode = AppMode::Error { message };
     }
 
     fn handle_normal_action(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Quit => {
-                self.should_quit = true;
+                // Esc/q closes detail focus first, like closing a sub-view
+                if self.focused_pane == FocusedPane::Detail {
+                    self.focused_pane = FocusedPane::Graph;
+                } else {
+                    self.should_quit = true;
+                }
             }
-            Action::MoveUp => {
-                self.move_selection(-1);
+            Action::FocusNext => {
+                self.focused_pane = match self.focused_pane {
+                    FocusedPane::Graph => FocusedPane::Detail,
+                    FocusedPane::Detail => FocusedPane::Graph,
+                };
             }
-            Action::MoveDown => {
-                self.move_selection(1);
-            }
-            Action::PageUp => {
-                self.move_selection(-10);
-            }
-            Action::PageDown => {
-                self.move_selection(10);
-            }
-            Action::GoToTop => {
-                self.select_first();
-            }
-            Action::GoToBottom => {
-                self.select_last();
-            }
+            Action::MoveUp => match self.focused_pane {
+                FocusedPane::Graph => self.move_selection(-1),
+                FocusedPane::Detail => self.scroll_detail(-1),
+            },
+            Action::MoveDown => match self.focused_pane {
+                FocusedPane::Graph => self.move_selection(1),
+                FocusedPane::Detail => self.scroll_detail(1),
+            },
+            Action::PageUp => match self.focused_pane {
+                FocusedPane::Graph => self.move_selection(-10),
+                FocusedPane::Detail => self.scroll_detail(-self.detail_half_page()),
+            },
+            Action::PageDown => match self.focused_pane {
+                FocusedPane::Graph => self.move_selection(10),
+                FocusedPane::Detail => self.scroll_detail(self.detail_half_page()),
+            },
+            Action::GoToTop => match self.focused_pane {
+                FocusedPane::Graph => self.select_first(),
+                FocusedPane::Detail => self.detail_scroll = 0,
+            },
+            Action::GoToBottom => match self.focused_pane {
+                FocusedPane::Graph => self.select_last(),
+                FocusedPane::Detail => self.detail_scroll = self.max_detail_scroll(),
+            },
             Action::JumpToHead => {
                 self.jump_to_head();
             }
@@ -1068,6 +1232,46 @@ impl App {
                     self.set_message("Diff not available");
                 }
             }
+            Action::CopyHash => {
+                let hash = self
+                    .selected_commit_node()
+                    .and_then(|node| node.commit.as_ref())
+                    .map(|commit| commit.oid.to_string());
+                match hash {
+                    Some(hash) => match crate::tui::copy_to_clipboard(&hash) {
+                        Ok(()) => self.set_message(format!("Copied {}", &hash[..7])),
+                        Err(e) => self.set_message(format!("Copy failed: {e}")),
+                    },
+                    None => self.set_message("No commit selected"),
+                }
+            }
+            Action::CopyBranch => {
+                let name = self.selected_branch_name().map(|s| s.to_string());
+                match name {
+                    Some(name) => match crate::tui::copy_to_clipboard(&name) {
+                        Ok(()) => self.set_message(format!("Copied '{}'", name)),
+                        Err(e) => self.set_message(format!("Copy failed: {e}")),
+                    },
+                    None => self.set_message("No branch selected"),
+                }
+            }
+            Action::CommitDialog => {
+                self.open_commit_dialog();
+            }
+            Action::Push => {
+                if self.is_pushing() {
+                    self.set_message("Push already in progress");
+                } else if self.repo.repo.head_detached().unwrap_or(false) {
+                    self.set_message("Cannot push: detached HEAD");
+                } else if let Some(branch) = self.head_name.clone() {
+                    self.mode = AppMode::Confirm {
+                        message: format!("Push '{}' to origin?", branch),
+                        action: ConfirmAction::Push(branch),
+                    };
+                } else {
+                    self.set_message("Cannot push: no current branch");
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -1126,6 +1330,18 @@ impl App {
                         self.set_message(format!("Cannot open diff: {e}"));
                     }
                 }
+            }
+            Action::StageToggle => {
+                self.stage_toggle_selected()?;
+            }
+            Action::StageAll => {
+                self.stage_all_files(true)?;
+            }
+            Action::UnstageAll => {
+                self.stage_all_files(false)?;
+            }
+            Action::CommitDialog => {
+                self.open_commit_dialog();
             }
             Action::Cancel | Action::Quit => {
                 self.return_to_normal();
@@ -1311,8 +1527,10 @@ impl App {
         // NOTE: Runs synchronously on the UI thread. For very large diffs (e.g. generated
         // files, large refactors) this may briefly block input. If this becomes a problem,
         // consider moving to a background task with a loading state, similar to commit diff summaries.
+        let started = Instant::now();
         let content = self.load_file_diff_content(file_path)?;
         let (rendered_lines, hunk_positions) = build_highlighted_lines(&content);
+        self.perf.record("open_file_diff", started.elapsed());
         let total_lines = rendered_lines.len();
         let max_line_width = rendered_lines.iter().map(|l| l.width()).max().unwrap_or(0);
 
@@ -1432,6 +1650,16 @@ impl App {
                         // Jump to selected result and exit search mode
                         self.jump_to_search_result();
                     }
+                    InputAction::CommitMessage => {
+                        let message = input.trim().to_string();
+                        if message.is_empty() {
+                            self.set_message("Commit message is empty");
+                            return Ok(());
+                        }
+                        let oid = create_commit(&self.repo.repo, &message)?;
+                        self.set_message(format!("Committed {}", &oid.to_string()[..7]));
+                        self.refresh(true)?;
+                    }
                 }
                 // Clear search state after confirming
                 self.search_state = SearchState::default();
@@ -1528,6 +1756,12 @@ impl App {
                     ConfirmAction::Rebase(name) => {
                         rebase_branch(&self.repo.repo, &name)?;
                     }
+                    ConfirmAction::Push(branch) => {
+                        // Runs in the background; no refresh needed yet
+                        self.start_push(branch);
+                        self.mode = AppMode::Normal;
+                        return Ok(());
+                    }
                 }
                 self.refresh(true)?;
                 self.mode = AppMode::Normal;
@@ -1540,12 +1774,52 @@ impl App {
         Ok(())
     }
 
-    fn move_selection(&mut self, delta: i32) {
+    /// Scroll the commit detail pane by delta, clamped to content (issue #27)
+    pub fn scroll_detail(&mut self, delta: i32) {
+        let max = self.max_detail_scroll();
+        self.detail_scroll = (self.detail_scroll as i32 + delta).clamp(0, max as i32) as u16;
+    }
+
+    fn max_detail_scroll(&self) -> u16 {
+        self.detail_content_height
+            .saturating_sub(self.detail_viewport_height)
+    }
+
+    fn detail_half_page(&self) -> i32 {
+        (self.detail_viewport_height / 2).max(1) as i32
+    }
+
+    pub fn move_selection(&mut self, delta: i32) {
         let max = self.graph_layout.nodes.len().saturating_sub(1);
         let current = self.graph_list_state.selected().unwrap_or(0);
         let new = (current as i32 + delta).clamp(0, max as i32) as usize;
         self.graph_list_state.select(Some(new));
         self.sync_branch_selection_to_node(new);
+    }
+
+    /// Select a graph node by absolute index (mouse click)
+    pub fn select_node(&mut self, idx: usize) {
+        if idx >= self.graph_layout.nodes.len() {
+            return;
+        }
+        self.graph_list_state.select(Some(idx));
+        self.sync_branch_selection_to_node(idx);
+    }
+
+    /// Enter file select mode with the given file index (mouse click).
+    /// Does nothing when no diff is available or the index is out of range.
+    pub fn open_file_select(&mut self, file_idx: usize) {
+        let Some(diff) = self.cached_diff() else {
+            return;
+        };
+        if file_idx >= diff.files.len() {
+            return;
+        }
+        let file_list = diff.files.clone();
+        self.mode = AppMode::FileSelect {
+            selected_index: file_idx,
+            file_list,
+        };
     }
 
     fn select_first(&mut self) {
@@ -1557,6 +1831,92 @@ impl App {
         let max = self.graph_layout.nodes.len().saturating_sub(1);
         self.graph_list_state.select(Some(max));
         self.sync_branch_selection_to_node(max);
+    }
+
+    /// Whether the uncommitted changes node is currently selected
+    pub fn is_uncommitted_selected(&self) -> bool {
+        matches!(self.current_diff_target(), Some(DiffTarget::Uncommitted))
+    }
+
+    /// Re-scan stage states after an explicit stage/unstage operation.
+    /// Display paths reuse the map maintained by refresh() instead.
+    fn reload_stage_states(&mut self) {
+        let started = Instant::now();
+        let (status, states, message) = Self::working_tree_snapshot(&self.repo);
+        self.perf.record("stage_states", started.elapsed());
+        if let Some(message) = message {
+            self.set_message(message);
+        }
+        self.working_tree_status = status;
+        self.stage_states = states;
+    }
+
+    /// Toggle stage state of the selected file in file select mode
+    fn stage_toggle_selected(&mut self) -> Result<()> {
+        if !self.is_uncommitted_selected() {
+            self.set_message("Staging is only available for uncommitted changes");
+            return Ok(());
+        }
+        let AppMode::FileSelect {
+            selected_index,
+            file_list,
+        } = &self.mode
+        else {
+            return Ok(());
+        };
+        let Some(file) = file_list.get(*selected_index) else {
+            return Ok(());
+        };
+        let path = file.path.clone();
+
+        let state = self
+            .stage_states
+            .get(&path)
+            .copied()
+            .unwrap_or(StageState::Unstaged);
+        match state {
+            StageState::Staged => unstage_path(&self.repo.repo, &path)?,
+            StageState::Unstaged | StageState::Partial => stage_path(&self.repo.repo, &path)?,
+        }
+        self.reload_stage_states();
+        Ok(())
+    }
+
+    /// Stage or unstage all working tree changes
+    fn stage_all_files(&mut self, stage: bool) -> Result<()> {
+        if !self.is_uncommitted_selected() {
+            self.set_message("Staging is only available for uncommitted changes");
+            return Ok(());
+        }
+        if stage {
+            stage_all(&self.repo.repo)?;
+        } else {
+            unstage_all(&self.repo.repo)?;
+        }
+        self.reload_stage_states();
+        Ok(())
+    }
+
+    /// Open the commit message dialog when staged changes exist
+    fn open_commit_dialog(&mut self) {
+        let has_staged = self
+            .repo
+            .stage_states()
+            .map(|states| {
+                states
+                    .values()
+                    .any(|s| matches!(s, StageState::Staged | StageState::Partial))
+            })
+            .unwrap_or(false);
+        if !has_staged {
+            self.set_message("No staged changes (press Space, then 's' to stage files)");
+            return;
+        }
+        self.mode = AppMode::Input {
+            title: "Commit Message".to_string(),
+            input: String::new(),
+            action: InputAction::CommitMessage,
+        };
     }
 
     /// Sync branch selection to the first branch of the given node
@@ -1765,7 +2125,8 @@ mod tests {
         let now = Instant::now();
         let commits = repo.get_commits(500).unwrap();
         let branches = repo.get_branches().unwrap();
-        let (working_tree_status, initial_message) = App::working_tree_status_snapshot(&repo);
+        let (working_tree_status, stage_states, initial_message) =
+            App::working_tree_snapshot(&repo);
         let initial_message_time = initial_message.as_ref().map(|_| now);
         let uncommitted_count = working_tree_status
             .as_ref()
@@ -1796,10 +2157,20 @@ mod tests {
             branches,
             graph_layout,
             graph_list_state,
+            focused_pane: FocusedPane::default(),
+            detail_scroll: 0,
+            detail_content_height: 0,
+            detail_viewport_height: 0,
+            layout: LayoutMap::default(),
+            files_pane_scroll: 0,
+            last_click: None,
+            status_hints: Vec::new(),
+            perf: PerfStats::default(),
             branch_positions,
             selected_branch_position,
             search_state: SearchState::default(),
             working_tree_status,
+            stage_states,
             diff_cache: None,
             diff_cache_oid: None,
             diff_loading_oid: None,
@@ -1819,6 +2190,7 @@ mod tests {
             message_time: initial_message_time,
             fetch_receiver: None,
             fetch_silent: false,
+            push_receiver: None,
             config: Config::default(),
             last_refresh_time: now,
             last_fetch_time: now,
@@ -1861,10 +2233,20 @@ mod tests {
                 max_lane: 0,
             },
             graph_list_state,
+            focused_pane: FocusedPane::default(),
+            detail_scroll: 0,
+            detail_content_height: 0,
+            detail_viewport_height: 0,
+            layout: LayoutMap::default(),
+            files_pane_scroll: 0,
+            last_click: None,
+            status_hints: Vec::new(),
+            perf: PerfStats::default(),
             branch_positions: Vec::new(),
             selected_branch_position: None,
             search_state: SearchState::default(),
             working_tree_status,
+            stage_states: HashMap::new(),
             diff_cache: None,
             diff_cache_oid: None,
             diff_loading_oid: None,
@@ -1884,6 +2266,7 @@ mod tests {
             message_time: None,
             fetch_receiver: None,
             fetch_silent: false,
+            push_receiver: None,
             config: Config::default(),
             last_refresh_time: Instant::now(),
             last_fetch_time: Instant::now(),
@@ -1988,6 +2371,38 @@ mod tests {
         assert!(!app.uncommitted_diff_loading);
         assert!(app.uncommitted_diff_receiver.is_none());
         assert_eq!(app.message.as_deref(), Some("Failed to load diff: boom"));
+    }
+
+    #[test]
+    fn stale_working_tree_status_recovers_after_diff_load_completes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tempdir.path()).unwrap();
+        commit_file(&repo, "tracked.txt", "tracked\n", "initial");
+        fs::write(tempdir.path().join("untracked.txt"), "hello\n").unwrap();
+
+        let git_repo = GitRepository::open(tempdir.path()).unwrap();
+        let mut app = make_app_from_repo(git_repo);
+
+        let thread_status = app.repo.get_working_tree_status().unwrap();
+        assert!(thread_status.is_some());
+
+        // Simulate a stale main-thread snapshot (auto-refresh is paused in
+        // FileSelect/FileDiff modes, so this state can persist indefinitely)
+        let mut stale = thread_status.clone().unwrap();
+        stale.mtime_hash = stale.mtime_hash.wrapping_add(1);
+        app.working_tree_status = Some(stale);
+
+        let (tx, rx) = mpsc::channel();
+        tx.send((Ok(CommitDiffInfo::default()), thread_status))
+            .unwrap();
+        app.uncommitted_diff_loading = true;
+        app.uncommitted_diff_receiver = Some(rx);
+
+        app.update_diff_cache();
+
+        assert!(app.uncommitted_cache_key.is_some());
+        assert!(app.cached_diff().is_some());
+        assert!(!app.is_diff_loading());
     }
 
     #[test]

@@ -10,16 +10,20 @@ pub mod status_bar;
 
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    widgets::{Block, Borders, Paragraph, Widget},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
+    style::{Color, Modifier, Style},
+    text::Span,
+    widgets::{
+        Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Widget,
+    },
     Frame,
 };
 
 use crate::app::{App, AppMode, InputAction};
 
 use self::{
-    commit_detail::CommitDetailWidget,
+    commit_detail::{CommitDetailWidget, FileListWidget},
     dialog::{BranchInfoPopup, ConfirmDialog, InputDialog},
     file_diff_view::FileDiffViewWidget,
     graph_view::GraphViewWidget,
@@ -37,10 +41,80 @@ const MIN_HEIGHT: u16 = 6;
 pub const MIN_WIDGET_WIDTH: u16 = 12;
 pub const MIN_WIDGET_HEIGHT: u16 = 3;
 
+/// Width threshold for switching the detail area to a vertical layout
+const VERTICAL_LAYOUT_THRESHOLD: u16 = 56;
+
+/// Border style for a pane depending on focus
+pub fn pane_border_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+/// Standard pane block: rounded borders, focus-aware border and title styles
+pub fn pane_block(title: &str, focused: bool) -> Block<'static> {
+    let title_style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    Block::default()
+        .title(Span::styled(format!(" {} ", title), title_style))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(pane_border_style(focused))
+}
+
+/// Render a vertical scrollbar inside a bordered pane when content overflows
+pub fn render_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    content_length: usize,
+    viewport_length: usize,
+    position: usize,
+) {
+    if content_length <= viewport_length || area.height <= 2 {
+        return;
+    }
+    let mut state =
+        ScrollbarState::new(content_length.saturating_sub(viewport_length)).position(position);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_style(Style::default().fg(Color::DarkGray)),
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut state,
+    );
+}
+
+/// Split the detail area into commit info and file list panes
+pub fn split_detail_area(area: Rect) -> (Rect, Rect) {
+    let direction = if area.width <= VERTICAL_LAYOUT_THRESHOLD {
+        Direction::Vertical
+    } else {
+        Direction::Horizontal
+    };
+    let chunks = Layout::default()
+        .direction(direction)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    (chunks[0], chunks[1])
+}
+
 /// Render a placeholder block when widget area is too small
 pub fn render_placeholder_block(area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray));
     block.render(area, buf);
 }
@@ -83,6 +157,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.diff_viewport_height = vertical[0].height.saturating_sub(2);
         app.diff_viewport_width = vertical[0].width.saturating_sub(2);
 
+        let total_lines = rendered_lines.len();
+        let scroll_position = *scroll_offset;
+
         frame.render_widget(
             FileDiffViewWidget::new(
                 content,
@@ -94,7 +171,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ),
             vertical[0],
         );
-        frame.render_widget(StatusBar::new(app), vertical[1]);
+        render_scrollbar(
+            frame,
+            vertical[0],
+            total_lines,
+            app.diff_viewport_height as usize,
+            scroll_position,
+        );
+
+        app.layout.status_bar = vertical[1];
+        let status_bar = StatusBar::new(app);
+        app.status_hints = status_bar.hint_regions(vertical[1]);
+        frame.render_widget(status_bar, vertical[1]);
         return;
     }
 
@@ -115,6 +203,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let graph_area = content_vertical[0];
     let detail_area = content_vertical[1];
+    let (commit_area, files_area) = split_detail_area(detail_area);
+
+    // Record pane regions for mouse hit-testing
+    app.layout = crate::app::LayoutMap {
+        graph: graph_area,
+        commit_detail: commit_area,
+        files: files_area,
+        status_bar: status_area,
+    };
+
+    // Update detail viewport size and clamp the scroll before rendering
+    app.detail_viewport_height = commit_area.height.saturating_sub(2);
+    let commit_widget = CommitDetailWidget::new(app);
+    app.detail_content_height = commit_widget.estimated_height(commit_area.width.saturating_sub(2));
+    app.scroll_detail(0);
+    let commit_widget = commit_widget.with_scroll(app.detail_scroll);
+
+    let files_widget = FileListWidget::new(app);
+    app.files_pane_scroll = files_widget.scroll_offset(files_area);
 
     // Render widgets
     frame.render_stateful_widget(
@@ -122,8 +229,28 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         graph_area,
         &mut app.graph_list_state,
     );
-    frame.render_widget(CommitDetailWidget::new(app), detail_area);
-    frame.render_widget(StatusBar::new(app), status_area);
+    frame.render_widget(commit_widget, commit_area);
+    frame.render_widget(files_widget, files_area);
+
+    // Scrollbars
+    render_scrollbar(
+        frame,
+        graph_area,
+        app.graph_layout.nodes.len(),
+        graph_area.height.saturating_sub(2) as usize,
+        app.graph_list_state.offset(),
+    );
+    render_scrollbar(
+        frame,
+        commit_area,
+        app.detail_content_height as usize,
+        app.detail_viewport_height as usize,
+        app.detail_scroll as usize,
+    );
+
+    let status_bar = StatusBar::new(app);
+    app.status_hints = status_bar.hint_regions(status_area);
+    frame.render_widget(status_bar, status_area);
 
     // Branch info popup (when multiple branches exist on selected node)
     render_branch_info_popup(frame, app, graph_area);

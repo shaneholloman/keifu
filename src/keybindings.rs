@@ -54,11 +54,14 @@ fn map_normal_mode(key: KeyEvent) -> Option<Action> {
         // Jump to HEAD (@ works with or without Shift depending on keyboard layout)
         (_, KeyCode::Char('@')) => Some(Action::JumpToHead),
 
-        // Branch jump
-        (_, KeyCode::Char(']')) | (KeyModifiers::NONE, KeyCode::Tab) => Some(Action::NextBranch),
-        (_, KeyCode::Char('[')) | (KeyModifiers::SHIFT, KeyCode::BackTab) => {
-            Some(Action::PrevBranch)
+        // Pane focus
+        (KeyModifiers::NONE, KeyCode::Tab) | (KeyModifiers::SHIFT, KeyCode::BackTab) => {
+            Some(Action::FocusNext)
         }
+
+        // Branch jump
+        (_, KeyCode::Char(']')) => Some(Action::NextBranch),
+        (_, KeyCode::Char('[')) => Some(Action::PrevBranch),
 
         // Branch selection within same commit
         (KeyModifiers::NONE, KeyCode::Char('h')) | (KeyModifiers::NONE, KeyCode::Left) => {
@@ -73,6 +76,12 @@ fn map_normal_mode(key: KeyEvent) -> Option<Action> {
         (KeyModifiers::NONE, KeyCode::Char('b')) => Some(Action::CreateBranch),
         (KeyModifiers::NONE, KeyCode::Char('d')) => Some(Action::DeleteBranch),
         (KeyModifiers::NONE, KeyCode::Char('f')) => Some(Action::Fetch),
+        (KeyModifiers::NONE, KeyCode::Char('c')) => Some(Action::CommitDialog),
+        (KeyModifiers::NONE, KeyCode::Char('p')) => Some(Action::Push),
+
+        // Clipboard
+        (KeyModifiers::NONE, KeyCode::Char('y')) => Some(Action::CopyHash),
+        (KeyModifiers::SHIFT, KeyCode::Char('Y')) => Some(Action::CopyBranch),
         // TODO: merge and rebase will be implemented in the future
         // (KeyModifiers::NONE, KeyCode::Char('m')) => Some(Action::Merge),
         // (KeyModifiers::NONE, KeyCode::Char('r')) => Some(Action::Rebase),
@@ -151,6 +160,11 @@ fn map_file_select_mode(key: KeyEvent) -> Option<Action> {
             Some(Action::FileSelectUp)
         }
         (KeyModifiers::NONE, KeyCode::Enter) => Some(Action::OpenFileDiff),
+        // Staging (uncommitted changes only)
+        (KeyModifiers::NONE, KeyCode::Char('s')) => Some(Action::StageToggle),
+        (KeyModifiers::NONE, KeyCode::Char('a')) => Some(Action::StageAll),
+        (KeyModifiers::NONE, KeyCode::Char('u')) => Some(Action::UnstageAll),
+        (KeyModifiers::NONE, KeyCode::Char('c')) => Some(Action::CommitDialog),
         (KeyModifiers::NONE, KeyCode::Esc) | (KeyModifiers::NONE, KeyCode::Char('q')) => {
             Some(Action::Cancel)
         }

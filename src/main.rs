@@ -1,14 +1,14 @@
 //! keifu: a TUI tool that shows Git commit graphs
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::Parser;
+use crossterm::event::Event;
 
 use keifu::{
-    app::{App, AppMode},
-    event::{get_key_event, get_mouse_scroll, poll_event},
-    git::configure_git_extensions,
-    keybindings::map_key_to_action,
-    tui, ui,
+    app::App, debug_server, event::poll_events, git::configure_git_extensions,
+    keybindings::map_key_to_action, logging, mouse, tui, ui,
 };
 
 #[derive(Parser)]
@@ -17,10 +17,28 @@ use keifu::{
     version,
     about = "A TUI tool to visualize Git commit graphs with branch genealogy"
 )]
-struct Cli {}
+struct Cli {
+    /// Append debug logs and a perf summary on exit to this file
+    /// (level via KEIFU_LOG, default "debug")
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
+
+    /// Listen for debug commands (NDJSON over TCP, e.g. 127.0.0.1:7167)
+    #[arg(long, value_name = "ADDR")]
+    debug_listen: Option<String>,
+}
 
 fn main() -> Result<()> {
-    Cli::parse();
+    let cli = Cli::parse();
+
+    if let Some(path) = &cli.log_file {
+        logging::init(path)?;
+    }
+    let debug_rx = match &cli.debug_listen {
+        Some(addr) => Some(debug_server::spawn(addr)?),
+        None => None,
+    };
+
     // Restore the terminal on panic
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -39,12 +57,15 @@ fn main() -> Result<()> {
     // Main loop
     loop {
         // Render
+        let draw_started = std::time::Instant::now();
         terminal.draw(|frame| {
             ui::draw(frame, &mut app);
         })?;
+        app.perf.record("draw", draw_started.elapsed());
 
-        // Check if async fetch has completed
+        // Check if async fetch/push has completed
         app.update_fetch_status();
+        app.update_push_status();
 
         // Auto-refresh check
         app.check_auto_refresh();
@@ -54,55 +75,49 @@ fn main() -> Result<()> {
             break;
         }
 
-        // Event handling
-        if let Some(event) = poll_event()? {
-            if let Some(key) = get_key_event(&event) {
-                if let Some(action) = map_key_to_action(key, &app.mode) {
-                    if let Err(e) = app.handle_action(action) {
-                        // Show errors in the UI
-                        app.show_error(format!("{}", e));
+        // Process all queued events before the next render
+        let events = poll_events()?;
+        if !events.is_empty() {
+            let events_started = std::time::Instant::now();
+            for event in events {
+                match event {
+                    Event::Key(key) => {
+                        if let Some(action) = map_key_to_action(key, &app.mode) {
+                            if let Err(e) = app.handle_action(action) {
+                                // Show errors in the UI
+                                app.show_error(format!("{}", e));
+                            }
+                        }
                     }
+                    Event::Mouse(mouse_event) => {
+                        mouse::handle_mouse(&mut app, mouse_event);
+                    }
+                    // Resize events trigger redraw automatically
+                    _ => {}
                 }
-            } else if let Some(scroll) = get_mouse_scroll(&event) {
-                let (action, multiplier) = match &app.mode {
-                    AppMode::FileDiff { .. } => {
-                        // Diff view: 3x scroll speed
-                        let a = if scroll > 0 {
-                            keifu::action::Action::ScrollDown
-                        } else {
-                            keifu::action::Action::ScrollUp
-                        };
-                        (a, 3)
-                    }
-                    AppMode::FileSelect { .. } => {
-                        // File select: mouse wheel moves selection
-                        let a = if scroll > 0 {
-                            keifu::action::Action::FileSelectDown
-                        } else {
-                            keifu::action::Action::FileSelectUp
-                        };
-                        (a, 1)
-                    }
-                    _ => {
-                        // Normal/other modes: standard graph movement
-                        let a = if scroll > 0 {
-                            keifu::action::Action::MoveDown
-                        } else {
-                            keifu::action::Action::MoveUp
-                        };
-                        (a, 1)
-                    }
-                };
-                for _ in 0..multiplier {
-                    if let Err(e) = app.handle_action(action.clone()) {
-                        app.show_error(format!("{}", e));
-                        break;
-                    }
+                if app.should_quit {
+                    break;
                 }
             }
-            // Resize events trigger redraw automatically
+            app.perf.record("events", events_started.elapsed());
+        }
+
+        // Process pending debug commands
+        if let Some(rx) = &debug_rx {
+            while let Ok(command) = rx.try_recv() {
+                let size = terminal.size()?;
+                let response = debug_server::handle_request(
+                    &mut app,
+                    size.width,
+                    size.height,
+                    command.request,
+                );
+                let _ = command.reply.send(response);
+            }
         }
     }
+
+    app.perf.log_summary();
 
     // Restore terminal
     tui::restore()?;

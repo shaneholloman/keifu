@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget},
 };
 
 pub struct HelpPopup;
@@ -34,11 +34,15 @@ impl Widget for HelpPopup {
                 Span::styled("Move up", desc_style),
             ]),
             Line::from(vec![
-                Span::styled("  ] / Tab    ", key_style),
+                Span::styled("  Tab        ", key_style),
+                Span::styled("Switch pane focus (graph / detail)", desc_style),
+            ]),
+            Line::from(vec![
+                Span::styled("  ]          ", key_style),
                 Span::styled("Select next branch", desc_style),
             ]),
             Line::from(vec![
-                Span::styled("  [ / S-Tab  ", key_style),
+                Span::styled("  [          ", key_style),
                 Span::styled("Select previous branch", desc_style),
             ]),
             Line::from(vec![
@@ -87,6 +91,14 @@ impl Widget for HelpPopup {
                 Span::styled("  f          ", key_style),
                 Span::styled("Fetch from origin", desc_style),
             ]),
+            Line::from(vec![
+                Span::styled("  c          ", key_style),
+                Span::styled("Commit staged changes", desc_style),
+            ]),
+            Line::from(vec![
+                Span::styled("  p          ", key_style),
+                Span::styled("Push current branch to origin", desc_style),
+            ]),
             // TODO: merge and rebase will be implemented in the future
             // Line::from(vec![
             //     Span::styled("  m          ", key_style),
@@ -119,13 +131,29 @@ impl Widget for HelpPopup {
                 Span::styled("Cancel search", desc_style),
             ]),
             Line::from(""),
-            Line::from(Span::styled("Diff", header_style)),
+            Line::from(Span::styled("Diff / Staging", header_style)),
             Line::from(vec![
                 Span::styled("  Space      ", key_style),
                 Span::styled("View file diffs", desc_style),
             ]),
+            Line::from(vec![
+                Span::styled("  s          ", key_style),
+                Span::styled("Stage/unstage selected file (file list)", desc_style),
+            ]),
+            Line::from(vec![
+                Span::styled("  a / u      ", key_style),
+                Span::styled("Stage all / unstage all (file list)", desc_style),
+            ]),
             Line::from(""),
             Line::from(Span::styled("Other", header_style)),
+            Line::from(vec![
+                Span::styled("  y          ", key_style),
+                Span::styled("Copy commit hash to clipboard", desc_style),
+            ]),
+            Line::from(vec![
+                Span::styled("  Y          ", key_style),
+                Span::styled("Copy branch name to clipboard", desc_style),
+            ]),
             Line::from(vec![
                 Span::styled("  R          ", key_style),
                 Span::styled("Refresh", desc_style),
@@ -144,6 +172,7 @@ impl Widget for HelpPopup {
             .title(" Help ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
+            .border_type(BorderType::Rounded)
             .style(Style::default().bg(Color::Black));
 
         let paragraph = Paragraph::new(lines).block(block);
