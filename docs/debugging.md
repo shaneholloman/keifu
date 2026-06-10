@@ -52,7 +52,6 @@ is unauthenticated.
 | `{"cmd":"dump"}` | `{"ok":true,"width":…,"height":…,"screen":"…"}` |
 | `{"cmd":"dump","width":100,"height":30}` | same, rendered at the given size |
 | `{"cmd":"state"}` | `{"ok":true,"mode":…,"selected_index":…,…}` |
-| `{"cmd":"perf"}` | per-operation timing stats and recent slow operations |
 
 - `keys` — whitespace-separated tokens fed through the normal keybinding
   layer. Single characters are sent as-is (uppercase implies Shift). Special
@@ -63,11 +62,8 @@ is unauthenticated.
 - `dump` — renders the current state to plain text. Without `width`/`height`
   the real terminal size is used (falling back to sane bounds when headless).
 - `state` — mode, focused pane, selection, HEAD, async operation status.
-- `perf` — count/avg/max/last per instrumented operation (`draw`, `events`,
-  `refresh`, `refresh.status`, `refresh.log`, `refresh.graph`,
-  `stage_states`, `open_file_diff`, …) plus the most recent operations that
-  exceeded 10 ms. Slow operations are also emitted as `tracing` debug events
-  when `--log-file` is active.
+
+For performance questions, use the log instead (see above).
 
 ### Example session
 

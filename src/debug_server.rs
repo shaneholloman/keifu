@@ -45,7 +45,6 @@ pub enum DebugRequest {
         height: Option<u16>,
     },
     State,
-    Perf,
 }
 
 pub struct DebugCommand {
@@ -151,30 +150,7 @@ pub fn handle_request(app: &mut App, width: u16, height: u16, request: DebugRequ
             }
         }
         DebugRequest::State => state_json(app),
-        DebugRequest::Perf => perf_json(app),
     }
-}
-
-fn perf_json(app: &App) -> Value {
-    let ms = |d: std::time::Duration| (d.as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
-    let mut ops = serde_json::Map::new();
-    for (name, agg) in app.perf.ops() {
-        ops.insert(
-            name.to_string(),
-            json!({
-                "count": agg.count,
-                "avg_ms": ms(agg.avg()),
-                "max_ms": ms(agg.max),
-                "last_ms": ms(agg.last),
-            }),
-        );
-    }
-    let recent_slow: Vec<Value> = app
-        .perf
-        .slow_log()
-        .map(|(name, d)| json!({"op": name, "ms": ms(d)}))
-        .collect();
-    json!({"ok": true, "ops": Value::Object(ops), "recent_slow": recent_slow})
 }
 
 /// Render the current app state to a plain-text screen using a test backend
