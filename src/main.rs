@@ -56,9 +56,11 @@ fn main() -> Result<()> {
     // Main loop
     loop {
         // Render
+        let draw_started = std::time::Instant::now();
         terminal.draw(|frame| {
             ui::draw(frame, &mut app);
         })?;
+        app.perf.record("draw", draw_started.elapsed());
 
         // Check if async fetch/push has completed
         app.update_fetch_status();
@@ -73,25 +75,30 @@ fn main() -> Result<()> {
         }
 
         // Process all queued events before the next render
-        for event in poll_events()? {
-            match event {
-                Event::Key(key) => {
-                    if let Some(action) = map_key_to_action(key, &app.mode) {
-                        if let Err(e) = app.handle_action(action) {
-                            // Show errors in the UI
-                            app.show_error(format!("{}", e));
+        let events = poll_events()?;
+        if !events.is_empty() {
+            let events_started = std::time::Instant::now();
+            for event in events {
+                match event {
+                    Event::Key(key) => {
+                        if let Some(action) = map_key_to_action(key, &app.mode) {
+                            if let Err(e) = app.handle_action(action) {
+                                // Show errors in the UI
+                                app.show_error(format!("{}", e));
+                            }
                         }
                     }
+                    Event::Mouse(mouse_event) => {
+                        mouse::handle_mouse(&mut app, mouse_event);
+                    }
+                    // Resize events trigger redraw automatically
+                    _ => {}
                 }
-                Event::Mouse(mouse_event) => {
-                    mouse::handle_mouse(&mut app, mouse_event);
+                if app.should_quit {
+                    break;
                 }
-                // Resize events trigger redraw automatically
-                _ => {}
             }
-            if app.should_quit {
-                break;
-            }
+            app.perf.record("events", events_started.elapsed());
         }
 
         // Process pending debug commands

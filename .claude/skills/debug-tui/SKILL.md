@@ -44,6 +44,7 @@ printf '%s\n' '{"cmd":"state"}' | nc -q1 127.0.0.1 $PORT
 | `{"cmd":"mouse","kind":"click","x":5,"y":3}` | Click / `scroll_up` / `scroll_down` at 0-based cell |
 | `{"cmd":"dump","width":110,"height":30}` | Render current state to plain text at that size |
 | `{"cmd":"state"}` | Mode, focused pane, selection, HEAD, async status |
+| `{"cmd":"perf"}` | Timing stats per operation + recent slow (>10ms) ops — use for any "feels slow" report |
 
 Every response is one JSON line. `dump` returns the screen as an escaped
 string in the `screen` field — pipe through `jq -r .screen` to read it. For

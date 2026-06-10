@@ -105,8 +105,23 @@ impl GitRepository {
     /// Get working tree status (staged + unstaged + untracked changes)
     /// Returns None if there are no changes
     pub fn get_working_tree_status(&self) -> Result<Option<WorkingTreeStatus>> {
+        Ok(self.working_tree_overview()?.0)
+    }
+
+    /// Get per-file stage states for the working tree
+    pub fn stage_states(&self) -> Result<HashMap<PathBuf, StageState>> {
+        Ok(self.working_tree_overview()?.1)
+    }
+
+    /// Scan the working tree once and return both the status (cache key)
+    /// and per-file stage states. `statuses()` is the most expensive call
+    /// on the UI thread, so everything derived from it shares one scan.
+    pub fn working_tree_overview(
+        &self,
+    ) -> Result<(Option<WorkingTreeStatus>, HashMap<PathBuf, StageState>)> {
+        let mut states = HashMap::new();
         if self.repo.is_bare() {
-            return Ok(None);
+            return Ok((None, states));
         }
 
         let mut opts = git2::StatusOptions::new();
@@ -140,83 +155,51 @@ impl GitRepository {
                     | git2::Status::WT_TYPECHANGE,
             );
 
-            if is_staged || has_worktree_changes {
-                let path = Self::path_from_bytes(entry.path_bytes());
-                if status.intersects(Status::WT_NEW) {
-                    let full_path = workdir.join(&path);
-                    if CommitDiffInfo::is_plain_directory(&full_path) {
-                        has_collapsed_untracked_dirs = true;
-                    }
-                }
-                file_paths.push(path);
-            }
-        }
-
-        if file_paths.is_empty() {
-            Ok(None)
-        } else {
-            file_paths.sort();
-
-            // Compute mtime hash from all changed files
-            let mtime_hash: u128 = file_paths
-                .iter()
-                .filter_map(|path| {
-                    let full_path = workdir.join(path);
-                    std::fs::symlink_metadata(&full_path)
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                        .map(|d| d.as_millis())
-                })
-                .sum();
-
-            Ok(Some(WorkingTreeStatus {
-                file_paths,
-                mtime_hash,
-                has_collapsed_untracked_dirs,
-            }))
-        }
-    }
-
-    /// Get per-file stage states for the working tree
-    pub fn stage_states(&self) -> Result<HashMap<PathBuf, StageState>> {
-        let mut states = HashMap::new();
-        if self.repo.is_bare() {
-            return Ok(states);
-        }
-
-        let mut opts = git2::StatusOptions::new();
-        opts.include_untracked(true)
-            .recurse_untracked_dirs(true)
-            .include_ignored(false);
-
-        for entry in self.repo.statuses(Some(&mut opts))?.iter() {
-            let status = entry.status();
-            let is_staged = status.intersects(
-                Status::INDEX_NEW
-                    | Status::INDEX_MODIFIED
-                    | Status::INDEX_DELETED
-                    | Status::INDEX_RENAMED
-                    | Status::INDEX_TYPECHANGE,
-            );
-            let has_worktree_changes = status.intersects(
-                Status::WT_NEW
-                    | Status::WT_MODIFIED
-                    | Status::WT_DELETED
-                    | Status::WT_RENAMED
-                    | Status::WT_TYPECHANGE,
-            );
-
             let state = match (is_staged, has_worktree_changes) {
                 (true, true) => StageState::Partial,
                 (true, false) => StageState::Staged,
                 (false, true) => StageState::Unstaged,
                 (false, false) => continue,
             };
-            states.insert(Self::path_from_bytes(entry.path_bytes()), state);
+
+            let path = Self::path_from_bytes(entry.path_bytes());
+            if status.intersects(Status::WT_NEW) {
+                let full_path = workdir.join(&path);
+                if CommitDiffInfo::is_plain_directory(&full_path) {
+                    has_collapsed_untracked_dirs = true;
+                }
+            }
+            states.insert(path.clone(), state);
+            file_paths.push(path);
         }
 
-        Ok(states)
+        if file_paths.is_empty() {
+            return Ok((None, states));
+        }
+
+        file_paths.sort();
+
+        // Compute mtime hash from all changed files
+        let mtime_hash: u128 = file_paths
+            .iter()
+            .filter_map(|path| {
+                let full_path = workdir.join(path);
+                std::fs::symlink_metadata(&full_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis())
+            })
+            .sum();
+
+        Ok((
+            Some(WorkingTreeStatus {
+                file_paths,
+                mtime_hash,
+                has_collapsed_untracked_dirs,
+            }),
+            states,
+        ))
     }
 }
 

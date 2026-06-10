@@ -10,6 +10,7 @@ pub mod graph;
 pub mod keybindings;
 pub mod logging;
 pub mod mouse;
+pub mod perf;
 pub mod search;
 pub mod tui;
 pub mod ui;

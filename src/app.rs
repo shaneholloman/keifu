@@ -26,6 +26,7 @@ use crate::{
         BranchInfo, CommitDiffInfo, CommitInfo, FileDiffContent, FileDiffInfo, GitRepository,
         StageState, WorkingTreeStatus,
     },
+    perf::PerfStats,
     search::{fuzzy_search_branches, FuzzySearchResult},
 };
 
@@ -227,6 +228,8 @@ pub struct App {
     pub last_click: Option<(Instant, u16, u16)>,
     /// Clickable status bar hint regions (updated during render)
     pub status_hints: Vec<(Rect, Action)>,
+    /// Performance counters (inspect via the debug server's "perf" command)
+    pub perf: PerfStats,
 
     // Branch selection state
     /// List of (node_index, branch_name) for all branches
@@ -286,12 +289,24 @@ pub struct App {
 }
 
 impl App {
-    fn working_tree_status_snapshot(
+    /// One `statuses()` scan yielding both the status snapshot (diff cache
+    /// key) and per-file stage states. The scan is the most expensive call
+    /// on the UI thread, so callers must not run it twice.
+    #[allow(clippy::type_complexity)]
+    fn working_tree_snapshot(
         repo: &GitRepository,
-    ) -> (Option<WorkingTreeStatus>, Option<String>) {
-        match repo.get_working_tree_status() {
-            Ok(status) => (status, None),
-            Err(e) => (None, Some(format!("Working tree status failed: {e}"))),
+    ) -> (
+        Option<WorkingTreeStatus>,
+        HashMap<PathBuf, StageState>,
+        Option<String>,
+    ) {
+        match repo.working_tree_overview() {
+            Ok((status, states)) => (status, states, None),
+            Err(e) => (
+                None,
+                HashMap::new(),
+                Some(format!("Working tree status failed: {e}")),
+            ),
         }
     }
 
@@ -306,7 +321,8 @@ impl App {
 
         let commits = repo.get_commits(500)?;
         let branches = repo.get_branches()?;
-        let (working_tree_status, initial_message) = Self::working_tree_status_snapshot(&repo);
+        let (working_tree_status, stage_states, initial_message) =
+            Self::working_tree_snapshot(&repo);
         let initial_message_time = initial_message.as_ref().map(|_| now);
         let uncommitted_count = working_tree_status
             .as_ref()
@@ -333,7 +349,7 @@ impl App {
             Some(0)
         };
 
-        let mut app = Self {
+        let app = Self {
             mode: AppMode::Normal,
             repo,
             repo_path,
@@ -350,11 +366,12 @@ impl App {
             files_pane_scroll: 0,
             last_click: None,
             status_hints: Vec::new(),
+            perf: PerfStats::default(),
             branch_positions,
             selected_branch_position,
             search_state: SearchState::default(),
             working_tree_status,
-            stage_states: HashMap::new(),
+            stage_states,
             diff_cache: None,
             diff_cache_oid: None,
             diff_loading_oid: None,
@@ -379,7 +396,6 @@ impl App {
             last_refresh_time: now,
             last_fetch_time: now,
         };
-        app.refresh_stage_states();
         Ok(app)
     }
 
@@ -495,6 +511,7 @@ impl App {
     /// If `force` is false, keeps cache when the same content is selected (for auto-refresh)
     pub fn refresh(&mut self, force: bool) -> Result<()> {
         tracing::debug!(force, "refresh repository data");
+        let refresh_started = Instant::now();
         // Save the current selection state for restoration
         let was_uncommitted_selected = self
             .graph_list_state
@@ -514,7 +531,10 @@ impl App {
             .map(|(_, name)| name.clone());
 
         // Get working tree status once and reuse
-        let (working_tree_status, status_message) = Self::working_tree_status_snapshot(&self.repo);
+        let status_started = Instant::now();
+        let (working_tree_status, stage_states, status_message) =
+            Self::working_tree_snapshot(&self.repo);
+        self.perf.record("refresh.status", status_started.elapsed());
         if let Some(message) = status_message {
             self.set_message(message);
         }
@@ -522,16 +542,21 @@ impl App {
             .as_ref()
             .map(|s| s.accurate_file_count());
         self.working_tree_status = working_tree_status;
+        self.stage_states = stage_states;
 
+        let log_started = Instant::now();
         self.commits = self.repo.get_commits(500)?;
         self.branches = self.repo.get_branches()?;
+        self.perf.record("refresh.log", log_started.elapsed());
         let head_commit_oid = self.repo.head_oid();
+        let graph_started = Instant::now();
         self.graph_layout = build_graph(
             &self.commits,
             &self.branches,
             uncommitted_count,
             head_commit_oid,
         );
+        self.perf.record("refresh.graph", graph_started.elapsed());
         self.head_name = self.repo.head_name();
 
         // Rebuild branch positions
@@ -619,7 +644,7 @@ impl App {
             }
         }
 
-        self.refresh_stage_states();
+        self.perf.record("refresh", refresh_started.elapsed());
 
         Ok(())
     }
@@ -786,6 +811,12 @@ impl App {
         if self.is_fetching() {
             return;
         }
+        // A synchronous refresh would delay any queued input by its full
+        // duration (perceived as a slow click); let input win and retry on
+        // the next tick.
+        if crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+            return;
+        }
         if matches!(
             self.mode,
             AppMode::FileSelect { .. } | AppMode::FileDiff { .. }
@@ -930,11 +961,12 @@ impl App {
                     // (issue #26).
                     let effective_status = status.or_else(|| self.working_tree_status.clone());
                     if effective_status.as_ref() != self.working_tree_status.as_ref() {
-                        let (fresh, message) = Self::working_tree_status_snapshot(&self.repo);
+                        let (fresh, states, message) = Self::working_tree_snapshot(&self.repo);
                         if let Some(message) = message {
                             self.set_message(message);
                         }
                         self.working_tree_status = fresh;
+                        self.stage_states = states;
                     }
                     if effective_status.as_ref() == self.working_tree_status.as_ref() {
                         self.uncommitted_cache_key = effective_status;
@@ -1193,7 +1225,6 @@ impl App {
                             selected_index: 0,
                             file_list,
                         };
-                        self.refresh_stage_states();
                     }
                 } else if self.is_diff_loading() {
                     self.set_message("Loading diff...");
@@ -1496,8 +1527,10 @@ impl App {
         // NOTE: Runs synchronously on the UI thread. For very large diffs (e.g. generated
         // files, large refactors) this may briefly block input. If this becomes a problem,
         // consider moving to a background task with a loading state, similar to commit diff summaries.
+        let started = Instant::now();
         let content = self.load_file_diff_content(file_path)?;
         let (rendered_lines, hunk_positions) = build_highlighted_lines(&content);
+        self.perf.record("open_file_diff", started.elapsed());
         let total_lines = rendered_lines.len();
         let max_line_width = rendered_lines.iter().map(|l| l.width()).max().unwrap_or(0);
 
@@ -1787,7 +1820,6 @@ impl App {
             selected_index: file_idx,
             file_list,
         };
-        self.refresh_stage_states();
     }
 
     fn select_first(&mut self) {
@@ -1806,16 +1838,17 @@ impl App {
         matches!(self.current_diff_target(), Some(DiffTarget::Uncommitted))
     }
 
-    /// Refresh per-file stage states (only while the uncommitted node is selected)
-    fn refresh_stage_states(&mut self) {
-        if self.is_uncommitted_selected() {
-            match self.repo.stage_states() {
-                Ok(states) => self.stage_states = states,
-                Err(e) => self.set_message(format!("Failed to read stage states: {e}")),
-            }
-        } else if !self.stage_states.is_empty() {
-            self.stage_states.clear();
+    /// Re-scan stage states after an explicit stage/unstage operation.
+    /// Display paths reuse the map maintained by refresh() instead.
+    fn reload_stage_states(&mut self) {
+        let started = Instant::now();
+        let (status, states, message) = Self::working_tree_snapshot(&self.repo);
+        self.perf.record("stage_states", started.elapsed());
+        if let Some(message) = message {
+            self.set_message(message);
         }
+        self.working_tree_status = status;
+        self.stage_states = states;
     }
 
     /// Toggle stage state of the selected file in file select mode
@@ -1845,7 +1878,7 @@ impl App {
             StageState::Staged => unstage_path(&self.repo.repo, &path)?,
             StageState::Unstaged | StageState::Partial => stage_path(&self.repo.repo, &path)?,
         }
-        self.refresh_stage_states();
+        self.reload_stage_states();
         Ok(())
     }
 
@@ -1860,7 +1893,7 @@ impl App {
         } else {
             unstage_all(&self.repo.repo)?;
         }
-        self.refresh_stage_states();
+        self.reload_stage_states();
         Ok(())
     }
 
@@ -2092,7 +2125,8 @@ mod tests {
         let now = Instant::now();
         let commits = repo.get_commits(500).unwrap();
         let branches = repo.get_branches().unwrap();
-        let (working_tree_status, initial_message) = App::working_tree_status_snapshot(&repo);
+        let (working_tree_status, stage_states, initial_message) =
+            App::working_tree_snapshot(&repo);
         let initial_message_time = initial_message.as_ref().map(|_| now);
         let uncommitted_count = working_tree_status
             .as_ref()
@@ -2131,11 +2165,12 @@ mod tests {
             files_pane_scroll: 0,
             last_click: None,
             status_hints: Vec::new(),
+            perf: PerfStats::default(),
             branch_positions,
             selected_branch_position,
             search_state: SearchState::default(),
             working_tree_status,
-            stage_states: HashMap::new(),
+            stage_states,
             diff_cache: None,
             diff_cache_oid: None,
             diff_loading_oid: None,
@@ -2206,6 +2241,7 @@ mod tests {
             files_pane_scroll: 0,
             last_click: None,
             status_hints: Vec::new(),
+            perf: PerfStats::default(),
             branch_positions: Vec::new(),
             selected_branch_position: None,
             search_state: SearchState::default(),
