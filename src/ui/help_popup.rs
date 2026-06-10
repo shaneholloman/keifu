@@ -147,6 +147,14 @@ impl Widget for HelpPopup {
             Line::from(""),
             Line::from(Span::styled("Other", header_style)),
             Line::from(vec![
+                Span::styled("  y          ", key_style),
+                Span::styled("Copy commit hash to clipboard", desc_style),
+            ]),
+            Line::from(vec![
+                Span::styled("  Y          ", key_style),
+                Span::styled("Copy branch name to clipboard", desc_style),
+            ]),
+            Line::from(vec![
                 Span::styled("  R          ", key_style),
                 Span::styled("Refresh", desc_style),
             ]),

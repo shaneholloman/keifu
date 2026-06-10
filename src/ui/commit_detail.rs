@@ -340,40 +340,6 @@ impl FileListWidget {
         }
     }
 
-    /// GitHub-style mini diffstat bar: 5 blocks split between green and red
-    fn diffstat_bar(insertions: usize, deletions: usize) -> Vec<Span<'static>> {
-        const BLOCKS: usize = 5;
-        let total = insertions + deletions;
-        if total == 0 {
-            return vec![Span::styled(
-                "·".repeat(BLOCKS),
-                Style::default().fg(Color::DarkGray),
-            )];
-        }
-        let mut green = (insertions * BLOCKS + total / 2) / total;
-        // Keep at least one block visible for each non-zero side
-        if insertions > 0 {
-            green = green.max(1);
-        }
-        if deletions > 0 {
-            green = green.min(BLOCKS - 1);
-        }
-        let mut spans = Vec::new();
-        if green > 0 {
-            spans.push(Span::styled(
-                "█".repeat(green),
-                Style::default().fg(Color::Green),
-            ));
-        }
-        if green < BLOCKS {
-            spans.push(Span::styled(
-                "█".repeat(BLOCKS - green),
-                Style::default().fg(Color::Red),
-            ));
-        }
-        spans
-    }
-
     /// Truncate a path to the given display width, keeping the tail
     fn truncate_path(path: &str, max_width: usize) -> String {
         if path.width() <= max_width {
@@ -435,11 +401,10 @@ impl FileListWidget {
                 lines.push(Line::from(spans));
                 lines.push(Line::from(""));
 
-                let show_bar = inner_width >= 45;
                 let show_stats = inner_width >= 28;
 
                 for row in rows {
-                    lines.push(self.build_file_line(row, inner_width, show_stats, show_bar));
+                    lines.push(self.build_file_line(row, inner_width, show_stats));
                 }
 
                 if *hidden_files > 0 {
@@ -460,9 +425,8 @@ impl FileListWidget {
         row: &FileRow,
         inner_width: usize,
         show_stats: bool,
-        show_bar: bool,
     ) -> Line<'static> {
-        // Right-aligned block: "+NNNN -NNNN bar"
+        // Right-aligned block: "+NNNN -NNNN"
         let stats_text = if !show_stats {
             String::new()
         } else if row.is_binary {
@@ -470,8 +434,7 @@ impl FileListWidget {
         } else {
             format!("+{:<4} -{:<4}", row.insertions, row.deletions)
         };
-        let bar_width = if show_bar && !row.is_binary { 6 } else { 0 };
-        let right_width = stats_text.width() + bar_width;
+        let right_width = stats_text.width();
 
         // Left part: marker + stage mark + kind + path
         let marker_width = 1 + row.stage_mark.map_or(0, |_| 2) + 3;
@@ -518,10 +481,6 @@ impl FileListWidget {
                     del.to_string(),
                     Style::default().fg(Color::Red),
                 ));
-                if show_bar {
-                    spans.push(Span::raw(" "));
-                    spans.extend(Self::diffstat_bar(row.insertions, row.deletions));
-                }
             }
         }
 

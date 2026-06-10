@@ -1201,6 +1201,29 @@ impl App {
                     self.set_message("Diff not available");
                 }
             }
+            Action::CopyHash => {
+                let hash = self
+                    .selected_commit_node()
+                    .and_then(|node| node.commit.as_ref())
+                    .map(|commit| commit.oid.to_string());
+                match hash {
+                    Some(hash) => match crate::tui::copy_to_clipboard(&hash) {
+                        Ok(()) => self.set_message(format!("Copied {}", &hash[..7])),
+                        Err(e) => self.set_message(format!("Copy failed: {e}")),
+                    },
+                    None => self.set_message("No commit selected"),
+                }
+            }
+            Action::CopyBranch => {
+                let name = self.selected_branch_name().map(|s| s.to_string());
+                match name {
+                    Some(name) => match crate::tui::copy_to_clipboard(&name) {
+                        Ok(()) => self.set_message(format!("Copied '{}'", name)),
+                        Err(e) => self.set_message(format!("Copy failed: {e}")),
+                    },
+                    None => self.set_message("No branch selected"),
+                }
+            }
             Action::CommitDialog => {
                 self.open_commit_dialog();
             }

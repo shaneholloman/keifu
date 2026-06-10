@@ -78,6 +78,10 @@ fn map_normal_mode(key: KeyEvent) -> Option<Action> {
         (KeyModifiers::NONE, KeyCode::Char('f')) => Some(Action::Fetch),
         (KeyModifiers::NONE, KeyCode::Char('c')) => Some(Action::CommitDialog),
         (KeyModifiers::NONE, KeyCode::Char('p')) => Some(Action::Push),
+
+        // Clipboard
+        (KeyModifiers::NONE, KeyCode::Char('y')) => Some(Action::CopyHash),
+        (KeyModifiers::SHIFT, KeyCode::Char('Y')) => Some(Action::CopyBranch),
         // TODO: merge and rebase will be implemented in the future
         // (KeyModifiers::NONE, KeyCode::Char('m')) => Some(Action::Merge),
         // (KeyModifiers::NONE, KeyCode::Char('r')) => Some(Action::Rebase),

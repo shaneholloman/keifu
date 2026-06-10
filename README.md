@@ -128,6 +128,9 @@ Staging keys work when the "uncommitted changes" row is selected.
 | Click on a status bar hint | Run that action |
 | Wheel scroll | Scrolls the pane under the cursor |
 
+Since keifu captures mouse input, use your terminal's modifier for native
+text selection (usually `Shift` + drag; `Fn` + drag on iTerm2).
+
 ### Search
 
 | Key | Action |
@@ -156,6 +159,8 @@ Staging keys work when the "uncommitted changes" row is selected.
 
 | Key | Action |
 | --- | --- |
+| `y` | Copy commit hash to clipboard (OSC 52) |
+| `Y` | Copy branch name to clipboard (OSC 52) |
 | `R` | Refresh repository data |
 | `?` | Toggle help |
 | `q` / `Esc` | Quit (returns focus to the graph first when the detail pane is focused) |

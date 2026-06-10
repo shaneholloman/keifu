@@ -30,6 +30,10 @@ pub enum Action {
     CommitDialog,
     Push,
 
+    // Clipboard
+    CopyHash,
+    CopyBranch,
+
     // UI
     FocusNext,
     ToggleHelp,
