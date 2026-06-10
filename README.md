@@ -131,6 +131,11 @@ Staging keys work when the "uncommitted changes" row is selected.
 Since keifu captures mouse input, use your terminal's modifier for native
 text selection (usually `Shift` + drag; `Fn` + drag on iTerm2).
 
+Note: Ghostty currently fans one wheel notch out into multiple scroll events
+for mouse-mode apps ([ghostty#3955](https://github.com/ghostty-org/ghostty/discussions/3955)),
+which can scroll a few extra lines per notch. Lowering `mouse-scroll-multiplier`
+in the Ghostty config works around it.
+
 ### Search
 
 | Key | Action |

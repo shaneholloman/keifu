@@ -130,6 +130,8 @@ keifu
 
 keifu はマウス入力をキャプチャするため、ターミナルネイティブのテキスト選択（範囲選択）には修飾キーを使ってください（多くのターミナルで `Shift` + ドラッグ、iTerm2 は `Fn` + ドラッグ）。
 
+注意: Ghostty は現状、mouse-mode のアプリに対してホイール 1 ノッチを複数のスクロールイベントに増幅して送るため（[ghostty#3955](https://github.com/ghostty-org/ghostty/discussions/3955)）、1 ノッチで数行余分にスクロールすることがあります。Ghostty 設定の `mouse-scroll-multiplier` を下げると回避できます。
+
 ### 検索
 
 | キー | 操作 |
