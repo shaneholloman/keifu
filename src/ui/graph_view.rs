@@ -56,6 +56,8 @@ fn display_width(s: &str) -> usize {
 pub struct GraphViewWidget<'a> {
     items: Vec<ListItem<'a>>,
     focused: bool,
+    /// (selected position, total rows) for the pane title
+    position: (usize, usize),
 }
 
 impl<'a> GraphViewWidget<'a> {
@@ -88,7 +90,16 @@ impl<'a> GraphViewWidget<'a> {
         let focused = matches!(app.mode, crate::app::AppMode::Normal)
             && app.focused_pane == crate::app::FocusedPane::Graph;
 
-        Self { items, focused }
+        let position = (
+            app.graph_list_state.selected().map_or(0, |idx| idx + 1),
+            app.graph_layout.nodes.len(),
+        );
+
+        Self {
+            items,
+            focused,
+            position,
+        }
     }
 }
 
@@ -323,8 +334,12 @@ fn render_graph_line<'a>(
 ) -> Line<'a> {
     let mut spans: Vec<Span> = Vec::new();
 
-    // Graph start marker (to distinguish from borders)
-    spans.push(Span::raw(" "));
+    // Graph start marker; accent bar makes the selected row easy to spot
+    if is_selected {
+        spans.push(Span::styled("▌", Style::default().fg(Color::Cyan)));
+    } else {
+        spans.push(Span::raw(" "));
+    }
     let mut left_width: usize = 1;
 
     // Render cells
@@ -500,7 +515,8 @@ impl<'a> StatefulWidget for GraphViewWidget<'a> {
             return;
         }
 
-        let block = super::pane_block("Commits", self.focused);
+        let title = format!("Commits {}/{}", self.position.0, self.position.1);
+        let block = super::pane_block(&title, self.focused);
 
         let highlight_style = Style::default()
             .bg(Color::DarkGray)
