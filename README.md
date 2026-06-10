@@ -5,7 +5,7 @@
 
 [日本語版はこちら](docs/README_JA.md)
 
-keifu (系譜, /keːɸɯ/) is a terminal UI tool that visualizes Git commit graphs. It shows a colored commit graph, commit details, and a summary of changed files, and lets you perform basic branch operations.
+keifu (系譜, /keːɸɯ/) is a terminal UI tool that visualizes Git commit graphs. It shows a colored commit graph, commit details, and a summary of changed files, and lets you perform everyday Git operations: branch switching, staging, committing, and pushing — with full mouse support.
 
 ![Screenshot](docs/win_terminal.png)
 
@@ -174,7 +174,7 @@ text selection (usually `Shift` + drag; `Fn` + drag on iTerm2).
 - When multiple branches point to the same commit, the label is collapsed to a single name with a `+N` suffix (e.g., `main +2`). Use `h`/`l` or `←`/`→` to switch between them.
 - Checking out `origin/xxx` creates or updates a local branch. Upstream is set only when creating a new branch. If the local branch exists but points to a different commit, it is force-updated to match the remote.
 - Remote branches are displayed, but delete operations only work with local branches.
-- Fetch requires the `origin` remote to be configured.
+- Fetch and push require the `origin` remote to be configured. Staging works per file (no hunk-level staging); commits include only staged changes, like plain `git commit`.
 
 ## License
 
